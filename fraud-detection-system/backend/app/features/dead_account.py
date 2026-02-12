@@ -87,10 +87,22 @@ class DeadAccountDetector:
         # ── low historical activity bonus ────────────────────
         low_activity_bonus = 10.0 if tx_count <= 3 else 0.0
 
+        # ── Sleep-and-Flash mule detection ───────────────────
+        # Velocity of Historical Deviation: current/avg > 50 AND dormant > 30d
+        sleep_flash_flag = False
+        sleep_flash_ratio = 0.0
+        if avg_amount > 0:
+            sleep_flash_ratio = tx_amount / avg_amount
+        if (sleep_flash_ratio >= settings.SLEEP_FLASH_RATIO_THRESHOLD
+                and days_slept >= settings.SLEEP_FLASH_DORMANT_DAYS):
+            sleep_flash_flag = True
+
         # ── fused risk ───────────────────────────────────────
         risk = 0.0
         if is_dormant or is_first_strike or days_slept > settings.DORMANT_DAYS_THRESHOLD:
             risk = inactivity_score + spike_score + first_strike_bonus + low_activity_bonus
+            if sleep_flash_flag:
+                risk += 20.0  # extra penalty for woken-mule pattern
         else:
             risk = spike_score * 0.3
 
@@ -105,6 +117,11 @@ class DeadAccountDetector:
             flags.append("Volume Spike After Dormancy")
         if spike_score > 20:
             flags.append("Sudden Volume Spike on Dormant Account")
+        if sleep_flash_flag:
+            flags.append(
+                f"Sleep-and-Flash Mule: ratio={sleep_flash_ratio:.0f}x, "
+                f"dormant={int(days_slept)}d"
+            )
 
         return {
             "is_dormant": is_dormant,
@@ -117,6 +134,8 @@ class DeadAccountDetector:
             "pass_through_ratio": 0.0,
             "pass_through_score": 0.0,
             "tx_count": tx_count,
+            "sleep_flash_flag": sleep_flash_flag,
+            "sleep_flash_ratio": round(sleep_flash_ratio, 2),
             "risk": round(risk, 2),
             "flags": flags,
         }

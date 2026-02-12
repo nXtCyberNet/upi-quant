@@ -12,7 +12,7 @@ class Settings(BaseSettings):
 
     # ── Application ─────────────────────────────────────────
     APP_NAME: str = "Real-Time Mule & Collusive Fraud Intelligence Engine"
-    APP_VERSION: str = "1.0.0"
+    APP_VERSION: str = "2.0.0"
     DEBUG: bool = True
     HOST: str = "0.0.0.0"
     PORT: int = 8000
@@ -62,7 +62,46 @@ class Settings(BaseSettings):
     NIGHT_START_HOUR: int = 23
     NIGHT_END_HOUR: int = 5
 
-    # ── Simulation ──────────────────────────────────────────
+    # ── New Feature Parameters (v2 schema) ──────────────────
+    # Device drift
+    CAPABILITY_MASK_CHANGE_WEIGHT: float = 10.0
+
+    # New device risk
+    NEW_DEVICE_HIGH_AMOUNT_THRESHOLD: float = 10000.0
+    NEW_DEVICE_PENALTY: float = 12.0
+
+    # SIM-swap multi-account device detection
+    DEVICE_MULTI_USER_THRESHOLD: int = 3
+    DEVICE_MULTI_USER_WINDOW_HOURS: int = 24
+    DEVICE_MULTI_USER_PENALTY: float = 25.0
+
+    # IP rotation
+    IP_ROTATION_WINDOW_HOURS: int = 24
+    IP_ROTATION_MAX_UNIQUE: int = 5
+    IP_ROTATION_PENALTY: float = 15.0
+
+    # Fixed-amount pattern detection
+    FIXED_AMOUNT_TOLERANCE: float = 0.01
+    FIXED_AMOUNT_MIN_COUNT: int = 3
+    FIXED_AMOUNT_PENALTY: float = 10.0
+
+    # Circadian anomaly (unusual transaction hour)
+    CIRCADIAN_ANOMALY_PENALTY: float = 20.0
+    CIRCADIAN_NEW_DEVICE_PENALTY: float = 35.0
+
+    # Transaction identicality index (same amount, same receiver)
+    TX_IDENTICALITY_WINDOW_HOURS: int = 1
+    TX_IDENTICALITY_MIN_COUNT: int = 3
+    TX_IDENTICALITY_PENALTY: float = 30.0
+
+    # Sleep-and-flash mule (woken mule detection)
+    SLEEP_FLASH_RATIO_THRESHOLD: float = 50.0
+    SLEEP_FLASH_DORMANT_DAYS: int = 30
+
+    # Geo-IP distance anomaly (km)
+    GEO_IP_DISTANCE_THRESHOLD_KM: float = 500.0
+
+    # Simulation ──────────────────────────────────────────
     SIMULATION_TPS: int = 500
     SIMULATION_TOTAL_TX: int = 10000
     SIMULATION_USER_COUNT: int = 500

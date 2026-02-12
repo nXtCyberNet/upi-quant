@@ -1,5 +1,5 @@
 """
-Risk fusion engine – optimised with explainability.
+Risk fusion engine – optimised with explainability (v2).
 
 Orchestrates all five feature extractors, applies the weighted fusion
 formula, determines risk level, collects flags, generates human-readable
@@ -53,6 +53,12 @@ def _build_reason(
         parts.append(
             f"Pass-through ratio {dead['pass_through_ratio']:.0%} exceeds threshold"
         )
+    if dead.get("sleep_flash_flag"):
+        ratio = dead.get("sleep_flash_ratio", 0)
+        parts.append(
+            f"Sleep-and-flash mule: amount {ratio:.0f}x above historical avg, "
+            f"dormant >30d"
+        )
 
     # Graph intelligence
     if graph.get("community_risk", 0) > 50:
@@ -63,12 +69,21 @@ def _build_reason(
     if graph.get("betweenness", 0) > 0.01:
         parts.append("High betweenness centrality (money router)")
 
-    # Device risk
+    # Device risk (v3 signals)
     acc_cnt = device.get("account_count", 0)
     if acc_cnt >= settings.DEVICE_ACCOUNT_THRESHOLD:
         parts.append(f"Shared device with {acc_cnt} other accounts")
-    if device.get("is_emulator"):
-        parts.append("Transaction from emulated device")
+    if device.get("new_device_flag"):
+        parts.append("Transaction from a new/unseen device")
+    if device.get("cap_mask_anomaly", 0) > 0:
+        parts.append("Device capability mask changed unexpectedly")
+    if device.get("new_device_high_mpin"):
+        parts.append("New device + high amount + MPIN authentication")
+    if device.get("device_multi_user_flag"):
+        parts.append(
+            f"SIM-swap: {device.get('device_multi_user_count', 0)} users on "
+            f"same device in 24h"
+        )
 
     # Behavioral
     if behav.get("impossible_travel"):
@@ -87,8 +102,17 @@ def _build_reason(
         parts.append(f"Foreign IP origin: {behav.get('asn_country', '?')}")
     if behav.get("asn_drift"):
         parts.append("ASN drift: unusual network for this user")
-    if behav.get("sim_not_verified"):
-        parts.append("SIM not verified for this transaction")
+    if behav.get("ip_rotation_flag"):
+        parts.append(f"IP rotation: {behav.get('ip_rotation_count', 0)} unique IPs in 24h")
+    if behav.get("fixed_amount_flag"):
+        parts.append("Fixed-amount pattern: repeated identical transfers")
+    if behav.get("circadian_anomaly"):
+        parts.append("Circadian anomaly: transaction at unusual hour for this user")
+    if behav.get("tx_identicality_flag"):
+        parts.append(
+            f"TX identicality: {behav.get('tx_identicality_count', 0)} identical-amount "
+            f"transfers to same receiver"
+        )
 
     # Velocity
     if vel.get("tx_per_min", 0) > 5:
@@ -142,16 +166,24 @@ class RiskEngine:
             self.behavioral.compute(
                 tx.sender_id, tx.amount, tx.timestamp,
                 tx.sender_lat, tx.sender_lon,
-                tx.channel,
                 tx.ip_address,
-                tx.sim_verified,
+                receiver_id=tx.receiver_id,
             )
         )
         dead_task = asyncio.create_task(
             self.dead_account.compute(tx.sender_id, tx.amount)
         )
         device_task = asyncio.create_task(
-            self.device_risk.compute(tx.device_hash)
+            self.device_risk.compute(
+                device_id=tx.device_id,
+                sender_id=tx.sender_id,
+                amount=tx.amount,
+                app_version=tx.app_version,
+                capability_mask=tx.capability_mask,
+                device_os=tx.device_os,
+                credential_type=tx.credential_type.value if tx.credential_type else None,
+                credential_sub_type=tx.credential_sub_type.value if tx.credential_sub_type else None,
+            )
         )
         graph_task = asyncio.create_task(
             self.graph_intel.compute(tx.sender_id)
@@ -170,6 +202,12 @@ class RiskEngine:
         s_device = device.get("risk", 0)
         s_graph = graph.get("risk", 0)
         s_velocity = vel.get("risk", 0)
+
+        # 2b. Circadian + New Device compound boost
+        #     If circadian anomaly detected AND device is new, amplify behavioral
+        if behav.get("circadian_anomaly") and device.get("new_device_flag"):
+            circadian_boost = settings.CIRCADIAN_NEW_DEVICE_PENALTY - settings.CIRCADIAN_ANOMALY_PENALTY
+            s_behavioral = min(s_behavioral + circadian_boost, 100.0)
 
         # 3. Weighted fusion
         fused = (

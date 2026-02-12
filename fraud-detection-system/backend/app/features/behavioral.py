@@ -1,5 +1,5 @@
 """
-Behavioural feature extraction.
+Behavioural feature extraction (v3).
 
 Computes per-transaction anomaly signals from the sender's recent history
 stored in Neo4j.  Returns a 0–100 behavioural risk score.
@@ -7,15 +7,22 @@ stored in Neo4j.  Returns a 0–100 behavioural risk score.
 Features
 ────────
 • amount_zscore          – how many σ the current amount deviates
+• iqr_outlier_flag       – robust outlier detection via IQR method
 • rolling_mean / std     – 25-tx rolling stats
 • time_since_last_tx     – seconds since previous transaction
 • velocity_score         – tx/min in the recent window
 • geo_distance           – km from last known location
 • impossible_travel_flag – travel speed > 250 km/h
 • ip_risk_score          – cloud ASN + reuse density
-• sim_not_verified       – SIM verification risk
 • night_anomaly_flag     – tx between 23:00 – 05:00
-• mahalanobis_distance   – multivariate deviation from baseline
+• ip_rotation_flag       – unique IPs in 24h window
+• fixed_amount_flag      – repeated identical amounts
+• circadian_anomaly      – tx at unusual hour for user’s historical pattern
+• tx_identicality_flag   – same amount to same receiver >3× in 1h
+
+Discarded signals
+─────────────────
+• mahalanobis_distance  – Requires N>30 to be stable; replaced by Z-Score & IQR
 """
 
 from __future__ import annotations
@@ -28,10 +35,17 @@ from typing import Dict, List, Optional
 import numpy as np
 
 from app.neo4j_manager import Neo4jManager
-from app.utils.cypher_queries import QUERY_USER_TX_HISTORY, QUERY_USER_PROFILE
+from app.utils.cypher_queries import (
+    QUERY_USER_TX_HISTORY,
+    QUERY_USER_PROFILE,
+    QUERY_IP_ROTATION,
+    QUERY_RECENT_AMOUNTS,
+    QUERY_USER_HOUR_DISTRIBUTION,
+    QUERY_IDENTICAL_TX_RECEIVER,
+)
 from app.features.asn_intelligence import compute_asn_risk
+from app.detection.anomaly_detection import iqr_outlier
 from app.config import settings
-from app.models.transaction import TransactionChannel
 
 logger = logging.getLogger(__name__)
 
@@ -48,11 +62,12 @@ def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
 
-def _mahalanobis(x: np.ndarray, mean: np.ndarray, cov_inv: np.ndarray) -> float:
-    """Mahalanobis distance of x from the given distribution."""
-    diff = x - mean
-    left = diff @ cov_inv
-    return float(np.sqrt(left @ diff))
+def _detect_fixed_amount_pattern(amounts: List[float], current: float, tolerance: float, min_count: int) -> bool:
+    """Check if current amount matches a repeated fixed-amount pattern."""
+    if len(amounts) < min_count:
+        return False
+    count = sum(1 for a in amounts if abs(a - current) / max(current, 1) <= tolerance)
+    return count >= min_count
 
 
 # ── main class ───────────────────────────────────────────────
@@ -70,9 +85,9 @@ class BehavioralFeatureExtractor:
         timestamp: datetime,
         sender_lat: Optional[float] = None,
         sender_lon: Optional[float] = None,
-        channel: TransactionChannel = TransactionChannel.UPI,
         ip_address: Optional[str] = None,
-        sim_verified: Optional[bool] = None,
+        receiver_id: Optional[str] = None,
+        is_new_device: bool = False,
     ) -> Dict:
         """Return a dict of feature values + a fused behavioural risk 0–100."""
 
@@ -89,18 +104,11 @@ class BehavioralFeatureExtractor:
         amounts: List[float] = [r["amount"] for r in history if r.get("amount")]
         timestamps: List[datetime] = [r["timestamp"] for r in history if r.get("timestamp")]
 
-        # ── amount features (UPI-only, 3σ rule for spike detection) ────
-        # Primary: use rolling history; Fallback: use stored profile stats
+        # ── amount features (3σ rule for spike detection) ────
         profile_mean = profile.get("avg_tx_amount") or 0.0
         profile_std = profile.get("std_tx_amount") or 0.0
 
-        is_upi = channel == TransactionChannel.UPI
-        if not is_upi:
-            amount_zscore = 0.0
-            rolling_mean = profile_mean or amount
-            rolling_std = profile_std or 0.0
-            spike = False
-        elif len(amounts) >= 2:
+        if len(amounts) >= 2:
             mean_a = float(np.mean(amounts))
             std_a = float(np.std(amounts)) or 1.0
             amount_zscore = (amount - mean_a) / std_a
@@ -108,7 +116,6 @@ class BehavioralFeatureExtractor:
             rolling_std = std_a
             spike = amount > mean_a + 3 * std_a
         elif profile_mean > 0:
-            # Thin history → use stored behavioral baseline
             mean_a = profile_mean
             std_a = profile_std if profile_std > 0 else profile_mean * 0.5
             amount_zscore = (amount - mean_a) / std_a
@@ -121,7 +128,7 @@ class BehavioralFeatureExtractor:
             rolling_std = 0.0
             spike = False
 
-        # Dormant-burst cross-signal: dormant + any amount > avg → high risk
+        # Dormant-burst cross-signal
         is_dormant = profile.get("is_dormant", False)
         dormant_burst = is_dormant and profile_mean > 0 and amount > profile_mean
 
@@ -131,9 +138,6 @@ class BehavioralFeatureExtractor:
         if ip_address:
             asn_result = await compute_asn_risk(sender_id, ip_address, self.neo4j)
             asn_risk_scaled = asn_result.get("asn_risk_scaled", 0.0)
-
-        # ── SIM verification awareness ─────────────────────
-        sim_not_verified = sim_verified is False
 
         # ── temporal features ────────────────────────────────
         if timestamps:
@@ -169,42 +173,95 @@ class BehavioralFeatureExtractor:
                 speed_kmh = geo_distance / (time_since_last / 3600)
                 impossible_travel = speed_kmh > settings.IMPOSSIBLE_TRAVEL_KMH
 
-        # ── Mahalanobis distance ─────────────────────────────
-        mahal_distance = 0.0
-        if len(amounts) >= 5:
+        # ── IQR outlier detection (replaces Mahalanobis) ─────
+        iqr_outlier_flag = False
+        if len(amounts) >= 4:
+            iqr_outlier_flag = iqr_outlier(amount, amounts)
+
+        # ── NEW: IP rotation (unique IPs in 24h window) ──────
+        ip_rotation_count = 0
+        ip_rotation_flag = False
+        try:
+            ip_rows = await self.neo4j.read_async(
+                QUERY_IP_ROTATION, {"user_id": sender_id}
+            )
+            if ip_rows:
+                ip_rotation_count = ip_rows[0].get("unique_ip_count", 0) or 0
+                ip_rotation_flag = ip_rotation_count >= settings.IP_ROTATION_MAX_UNIQUE
+        except Exception:  # noqa: BLE001
+            pass
+
+        # ── NEW: Fixed-amount pattern detection ──────────────
+        fixed_amount_flag = False
+        try:
+            recent_amt_rows = await self.neo4j.read_async(
+                QUERY_RECENT_AMOUNTS,
+                {"user_id": sender_id, "window_hours": settings.IP_ROTATION_WINDOW_HOURS},
+            )
+            recent_amts = [r["amount"] for r in recent_amt_rows if r.get("amount")]
+            fixed_amount_flag = _detect_fixed_amount_pattern(
+                recent_amts, amount,
+                settings.FIXED_AMOUNT_TOLERANCE,
+                settings.FIXED_AMOUNT_MIN_COUNT,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+        # ── NEW: Circadian anomaly (unusual hour for user) ───
+        circadian_anomaly = False
+        circadian_score = 0.0
+        try:
+            hour_rows = await self.neo4j.read_async(
+                QUERY_USER_HOUR_DISTRIBUTION, {"user_id": sender_id}
+            )
+            if hour_rows and len(hour_rows) >= 3:
+                hour_counts = {r["hour"]: r["cnt"] for r in hour_rows}
+                total_tx = sum(hour_counts.values())
+                current_hour_count = hour_counts.get(hour, 0)
+                # If this hour has <2% of user's total transactions, it's unusual
+                if total_tx >= 10 and current_hour_count / total_tx < 0.02:
+                    circadian_anomaly = True
+                    circadian_score = (
+                        settings.CIRCADIAN_NEW_DEVICE_PENALTY if is_new_device
+                        else settings.CIRCADIAN_ANOMALY_PENALTY
+                    )
+        except Exception:  # noqa: BLE001
+            pass
+
+        # ── NEW: Transaction identicality index ───────────
+        tx_identicality_flag = False
+        tx_identicality_count = 0
+        if receiver_id:
             try:
-                feat_matrix = np.column_stack(
-                    [
-                        amounts[: min(len(amounts), len(timestamps))],
-                        [
-                            (timestamps[i] - timestamps[i + 1]).total_seconds()
-                            if i + 1 < len(timestamps)
-                            and isinstance(timestamps[i], datetime)
-                            and isinstance(timestamps[i + 1], datetime)
-                            else 0
-                            for i in range(min(len(amounts), len(timestamps)))
-                        ],
-                    ]
+                ident_rows = await self.neo4j.read_async(
+                    QUERY_IDENTICAL_TX_RECEIVER,
+                    {
+                        "sender_id": sender_id,
+                        "receiver_id": receiver_id,
+                        "amount": amount,
+                        "window_hours": settings.TX_IDENTICALITY_WINDOW_HOURS,
+                    },
                 )
-                mean_vec = np.mean(feat_matrix, axis=0)
-                cov = np.cov(feat_matrix, rowvar=False)
-                cov_inv = np.linalg.pinv(cov)
-                x_vec = np.array([amount, time_since_last])
-                mahal_distance = _mahalanobis(x_vec, mean_vec, cov_inv)
+                if ident_rows:
+                    tx_identicality_count = ident_rows[0].get("identical_count", 0) or 0
+                    tx_identicality_flag = tx_identicality_count >= settings.TX_IDENTICALITY_MIN_COUNT
             except Exception:  # noqa: BLE001
-                mahal_distance = 0.0
+                pass
 
         # ── fuse into 0–100 risk ─────────────────────────────
         risk = 0.0
-        risk += min(abs(amount_zscore) * 10, 30)          # up to 30 (3σ rule, UPI-only)
+        risk += min(abs(amount_zscore) * 10, 30)          # up to 30
         risk += velocity_score * 20                        # up to 20
         risk += (1.0 if impossible_travel else 0.0) * 20   # 0 or 20
         risk += (1.0 if night_flag else 0.0) * 5           # 0 or 5
-        risk += min(mahal_distance * 2, 15)                 # up to 15
-        risk += (1.0 if spike else 0.0) * 10               # 0 or 10 (statistical outlier, UPI-only)
-        risk += (1.0 if dormant_burst else 0.0) * 15       # 0 or 15 (dormant + above avg)
-        risk += asn_risk_scaled                             # 0–20 (MMDB ASN intelligence)
-        risk += (10.0 if sim_not_verified else 0.0)        # 0 or 10
+        risk += (1.0 if iqr_outlier_flag else 0.0) * 15    # 0 or 15 (replaces Mahalanobis)
+        risk += (1.0 if spike else 0.0) * 10               # 0 or 10
+        risk += (1.0 if dormant_burst else 0.0) * 15       # 0 or 15
+        risk += asn_risk_scaled                             # 0–20
+        risk += (settings.IP_ROTATION_PENALTY if ip_rotation_flag else 0.0)  # 0 or 15
+        risk += (settings.FIXED_AMOUNT_PENALTY if fixed_amount_flag else 0.0)  # 0 or 10
+        risk += circadian_score                             # 0 or 20/35
+        risk += (settings.TX_IDENTICALITY_PENALTY if tx_identicality_flag else 0.0)  # 0 or 30
         risk = min(risk, 100.0)
 
         flags = []
@@ -216,14 +273,23 @@ class BehavioralFeatureExtractor:
             flags.append(f"Impossible travel: {geo_distance:.0f}km")
         if night_flag:
             flags.append("Night-time transaction")
-        if sim_not_verified:
-            flags.append("SIM not verified")
         if asn_result.get("asn_risk", 0) >= 0.5:
             flags.append(f"ASN Risk ({asn_result.get('asn_class', 'UNKNOWN')}): score={asn_result['asn_risk']:.2f}")
         if asn_result.get("foreign_flag"):
             flags.append(f"Foreign IP: {asn_result.get('org_name', '?')} ({asn_result.get('country', '?')})")
         if asn_result.get("asn_drift"):
             flags.append("ASN Drift: IP network differs from user's usual pattern")
+        if ip_rotation_flag:
+            flags.append(f"IP Rotation: {ip_rotation_count} unique IPs in 24h")
+        if fixed_amount_flag:
+            flags.append(f"Fixed Amount Pattern: repeated ₹{amount:.2f} transfers")
+        if circadian_anomaly:
+            flags.append(f"Circadian Anomaly: tx at hour {hour} is unusual for user")
+        if tx_identicality_flag:
+            flags.append(
+                f"TX Identicality: {tx_identicality_count} identical amount "
+                f"transfers to same receiver in {settings.TX_IDENTICALITY_WINDOW_HOURS}h"
+            )
 
         features = {
             "amount_zscore": round(amount_zscore, 4),
@@ -236,6 +302,7 @@ class BehavioralFeatureExtractor:
             "is_night": night_flag,
             "spike_flag": spike,
             "dormant_burst": dormant_burst,
+            "iqr_outlier_flag": iqr_outlier_flag,
             "ip_risk_score": round(asn_risk_scaled, 2),
             "asn_risk": asn_result.get("asn_risk", 0.0),
             "asn_risk_scaled": round(asn_risk_scaled, 2),
@@ -246,8 +313,13 @@ class BehavioralFeatureExtractor:
             "asn_entropy": asn_result.get("asn_entropy", 0.0),
             "asn_density": asn_result.get("asn_density", 0.0),
             "asn_base": asn_result.get("asn_base", 0.0),
-            "sim_not_verified": sim_not_verified,
-            "mahalanobis_distance": round(mahal_distance, 4),
+            "ip_rotation_count": ip_rotation_count,
+            "ip_rotation_flag": ip_rotation_flag,
+            "fixed_amount_flag": fixed_amount_flag,
+            "circadian_anomaly": circadian_anomaly,
+            "circadian_score": round(circadian_score, 2),
+            "tx_identicality_flag": tx_identicality_flag,
+            "tx_identicality_count": tx_identicality_count,
             "risk": round(risk, 2),
             "flags": flags,
         }

@@ -46,6 +46,9 @@ CITIES = [
 ]
 
 OS_OPTIONS = ["Android 13", "Android 14", "iOS 17", "iOS 16"]
+DEVICE_TYPES = ["ANDROID", "IOS", "WEB"]
+APP_VERSIONS = ["3.0.0", "3.1.0", "3.2.0", "3.3.0", "2.9.0"]
+CAPABILITY_MASKS = ["0xFF", "0xFE", "0xFC", "0xF0", "0x7F"]
 
 
 def main():
@@ -127,19 +130,21 @@ def main():
         for i in range(DEVICE_COUNT):
             session.run(
                 """
-                MERGE (d:Device {device_hash: $hash})
-                SET d.os           = $os,
-                    d.model        = $model,
-                    d.is_emulator  = $emu,
-                    d.device_score = 0.0,
-                    d.account_count = 0,
-                    d.created_at   = datetime()
+                MERGE (d:Device {device_id: $dev_id})
+                SET d.os              = $os,
+                    d.device_type     = $device_type,
+                    d.app_version     = $app_version,
+                    d.capability_mask = $cap_mask,
+                    d.device_score    = 0.0,
+                    d.account_count   = 0,
+                    d.created_at      = datetime()
                 """,
                 {
-                    "hash": f"DEV{i:04d}",
+                    "dev_id": f"DEV{i:04d}",
                     "os": random.choice(OS_OPTIONS),
-                    "model": f"Model-{random.randint(1, 50)}",
-                    "emu": random.random() < 0.03,
+                    "device_type": random.choice(DEVICE_TYPES),
+                    "app_version": random.choice(APP_VERSIONS),
+                    "cap_mask": random.choice(CAPABILITY_MASKS),
                 },
             )
 
@@ -148,7 +153,7 @@ def main():
         for i in range(8):
             session.run(
                 """
-                MATCH (u:User {user_id: $uid}), (d:Device {device_hash: 'DEV0000'})
+                MATCH (u:User {user_id: $uid}), (d:Device {device_id: 'DEV0000'})
                 MERGE (u)-[:USES_DEVICE]->(d)
                 """,
                 {"uid": f"U{i:04d}"},
@@ -160,7 +165,7 @@ def main():
             dev_idx = random.randint(1, DEVICE_COUNT - 1)
             session.run(
                 """
-                MATCH (u:User {user_id: $uid}), (d:Device {device_hash: $dev})
+                MATCH (u:User {user_id: $uid}), (d:Device {device_id: $dev})
                 MERGE (u)-[:USES_DEVICE]->(d)
                 """,
                 {"uid": f"U{i:04d}", "dev": f"DEV{dev_idx:04d}"},

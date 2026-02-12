@@ -109,7 +109,7 @@
 | **Queue** | Redis 7 Streams | Transaction ingestion pipeline (consumer groups) |
 | **Graph DB** | Neo4j 5.15 + GDS Plugin | Transaction graph, feature reads, batch algorithms |
 | **ASN Intelligence** | MaxMind MMDB (local) | Indian IPv4 ASN classification (offline, no API calls) |
-| **Computation** | NumPy, SciPy | Statistical features (z-score, Mahalanobis, IQR) |
+| **Computation** | NumPy, SciPy | Statistical features (z-score, IQR outlier, rolling stats) |
 | **Models** | Pydantic v2 | Request/response validation, settings management |
 | **Containerisation** | Docker Compose | Neo4j + Redis orchestration |
 
@@ -390,10 +390,21 @@ behav, dead, device, graph, vel = await asyncio.gather(
 
 # 5. Feature Extractor №1 — Behavioural Intelligence
 
-**File:** `app/features/behavioral.py`
+**File:** `app/features/behavioral.py` **(v3)**
 
-**Input:** sender_id, amount, timestamp, lat/lon, channel, ip_address, sim_verified
+**Input:** sender_id, amount, timestamp, lat/lon, ip_address, receiver_id (optional), is_new_device (optional)
 **Output:** S_behavioral ∈ [0, 100] + feature dict + flags
+
+### v3 Changes
+
+| Change | Detail |
+|--------|--------|
+| **Removed** | Mahalanobis distance — requires N>30 to stabilise; failed for new users |
+| **Removed** | SIM verification flag — removed from schema entirely |
+| **Added** | IQR outlier detection — robust replacement for Mahalanobis (works with N≥4) |
+| **Added** | Circadian anomaly — flags transactions at hours representing <2% of user's history |
+| **Added** | TX identicality index — detects same-amount transfers to same receiver ≥3× in 1h |
+| **Added** | Compound: circadian + new device → amplified penalty (35 pts vs 20 pts) |
 
 ---
 
@@ -438,16 +449,7 @@ Returns scaled ASN risk ∈ [0, 20].
 
 ---
 
-## 5.4 SIM Verification Risk
-
-```
-SIM_Risk = 10   if sim_verified == False
-           0    otherwise
-```
-
----
-
-## 5.5 Velocity Feature
+## 5.4 Velocity Feature
 
 ```
 Δt = t_current - t_last
@@ -463,7 +465,7 @@ Where B_burst = 10.
 
 ---
 
-## 5.6 Night-Time Flag
+## 5.5 Night-Time Flag
 
 ```
 Night = 1  if hour ≥ 23 OR hour ≤ 5
@@ -471,7 +473,7 @@ Night = 1  if hour ≥ 23 OR hour ≤ 5
 
 ---
 
-## 5.7 Geo Distance & Impossible Travel
+## 5.6 Geo Distance & Impossible Travel
 
 Haversine formula:
 
@@ -494,19 +496,84 @@ if (d / (Δt / 3600)) > 250 km/h
 
 ---
 
-## 5.8 Mahalanobis Outlier Score
+## 5.7 IQR Outlier Detection (Replaces Mahalanobis)
 
-Applicable when ≥ 5 historical tx.
+Applicable when ≥ 4 historical transactions.
 
 ```
-D_M(x) = √((x - μ)ᵀ Σ⁻¹ (x - μ))
+Q1 = percentile(amounts, 25)
+Q3 = percentile(amounts, 75)
+IQR = Q3 - Q1
+
+Outlier = 1
+  if amount < Q1 - 1.5·IQR
+  OR amount > Q3 + 1.5·IQR
 ```
 
-x = [amount, Δt]
+**Why IQR over Mahalanobis:**
+- Mahalanobis requires N>30 for stable covariance estimation; fails for new users
+- IQR is robust with as few as 4 samples
+- Non-parametric: no Gaussian assumption required
+- Lower computational cost (no matrix inversion)
+
+Contribution: +15 points if outlier detected.
 
 ---
 
-## 5.9 Behavioural Risk Aggregation
+## 5.8 Circadian Anomaly Detection (NEW v3)
+
+Detects transactions at hours that are statistically unusual for the specific user.
+
+```cypher
+MATCH (u:User {user_id: $user_id})-[:SENT]->(tx:Transaction)
+RETURN tx.timestamp.hour AS hour, count(tx) AS cnt
+```
+
+```
+CircadianAnomaly = 1
+  if total_tx ≥ 10
+  AND hour_count(current_hour) / total_tx < 0.02
+```
+
+Base penalty: **20 points**.
+
+### Compound: Circadian + New Device
+
+If circadian anomaly AND device is new for this user:
+
+```
+CircadianScore = 35   (amplified from 20)
+```
+
+This compound is computed post-gather in the risk engine, since behavioral
+and device extractors run concurrently.
+
+---
+
+## 5.9 TX Identicality Index (NEW v3)
+
+Detects structuring — the same sender sending identical amounts to the same receiver repeatedly in a short window.
+
+```cypher
+MATCH (sender:User {user_id: $sender_id})-[:SENT]->(tx:Transaction)
+      -[:RECEIVED_BY]->(receiver:User {user_id: $receiver_id})
+WHERE tx.timestamp > datetime() - duration({hours: $window_hours})
+  AND abs(tx.amount - $amount) < 1.0
+RETURN count(tx) AS identical_count
+```
+
+```
+TX_Identicality = 1
+  if identical_count ≥ TX_IDENTICALITY_MIN_COUNT (default 3)
+```
+
+Contribution: **+30 points** if flagged.
+
+Common structuring amounts in Indian UPI fraud: ₹4,999, ₹5,000, ₹7,500, ₹9,999.
+
+---
+
+## 5.10 Behavioural Risk Aggregation (v3)
 
 ```
 S_behavioral = min(
@@ -514,25 +581,33 @@ S_behavioral = min(
   + V·20
   + 𝟙[IT]·20
   + 𝟙[Night]·5
-  + min(D_M·2, 15)
+  + 𝟙[IQR]·15
   + 𝟙[Spike]·10
   + 𝟙[DormantBurst]·15
   + R_ASN
-  + 𝟙[¬SIM]·10
+  + 𝟙[IPRotation]·15
+  + 𝟙[FixedAmount]·10
+  + CircadianScore
+  + 𝟙[TxIdenticality]·30
 , 100)
 ```
 
-| Component         | Max Points |
-| ----------------- | ---------- |
-| Amount z-score    | 30         |
-| Velocity          | 20         |
-| Impossible travel | 20         |
-| Mahalanobis       | 15         |
-| Dormant burst     | 15         |
-| 3σ spike          | 10         |
-| SIM risk          | 10         |
-| ASN risk          | 20         |
-| Night flag        | 5          |
+| Component           | Max Points | Status |
+| ------------------- | ---------- | ------ |
+| Amount z-score      | 30         | ✅ Active |
+| Velocity            | 20         | ✅ Active |
+| Impossible travel   | 20         | ✅ Active |
+| IQR outlier         | 15         | ✅ NEW (replaced Mahalanobis) |
+| Dormant burst       | 15         | ✅ Active |
+| 3σ spike            | 10         | ✅ Active |
+| ASN risk            | 20         | ✅ Active |
+| IP rotation         | 15         | ✅ Active |
+| Fixed-amount        | 10         | ✅ Active |
+| Circadian anomaly   | 20 / 35    | ✅ NEW (35 if compound w/ new device) |
+| TX identicality     | 30         | ✅ NEW |
+| Night flag          | 5          | ✅ Active |
+| ~~Mahalanobis~~     | ~~15~~     | ❌ Removed (unstable for N<30) |
+| ~~SIM verification~~| ~~10~~     | ❌ Removed (from schema) |
 
 Raw total may exceed 100 but is capped.
 
@@ -651,10 +726,21 @@ Community risk is weighted to avoid over-amplification.
 
 # 7. Feature Extractor №3 — Device Risk
 
-**File:** `app/features/device_risk.py`
+**File:** `app/features/device_risk.py` **(v3)**
 
-**Input:** device_hash
+**Input:** device_id, sender_id, amount, app_version, capability_mask, device_os, credential_type, credential_sub_type
 **Output:** S_device ∈ [0, 100] + features + flags
+
+### v3 Changes
+
+| Change | Detail |
+|--------|--------|
+| **Removed** | `app_downgrade_flag` — Banks/NPCI force updates; if app is open, it's compliant |
+| **Removed** | `outdated_app_score` — Same reasoning as above |
+| **Removed** | `is_emulator` field — Removed from DeviceInfo model |
+| **Added** | SIM-swap multi-user device detection (>3 users on same device in 24h) |
+| **Added** | Device drift scoring (OS family change + capability mask Hamming distance) |
+| **Added** | New device + high amount + MPIN compound signal |
 
 ---
 
@@ -666,15 +752,6 @@ MultiAccount =
     25   if N_accounts ≥ 3
     10   if N_accounts ≥ 2
     0    otherwise
-```
-
----
-
-## 7.2 Emulator Detection
-
-```
-Emulator = 25   if device_is_emulator
-           0    otherwise
 ```
 
 ---
@@ -712,33 +789,109 @@ HighRiskBonus = 10   if max(user_risk) > 80
 UPI apps are valid only on Android and iOS.
 
 ```
-OSAnomaly = 15   if OS ∉ {Android*, iOS*}
+OSAnomaly = 10   if OS ∉ {Android*, iOS*}
             0    otherwise
 ```
 
 ---
 
-## 7.6 Device Risk Fusion
+## 7.6 Device Drift Score (NEW v3)
+
+Detects sudden changes in the device environment reported for a known device.
+
+### 7.6a OS Family Change
+
+```
+OS_Drift = 5   if stored_os_family ≠ current_os_family
+           0   otherwise
+```
+
+Example: Device previously reported "Android" now reports "iOS" → potential cloned credential.
+
+### 7.6b Capability Mask Change (Hamming Distance)
+
+```
+Δ_mask = HammingDistance(stored_mask, current_mask)
+Cap_Drift = min(Δ_mask · CAPABILITY_MASK_CHANGE_WEIGHT · 0.3, 5.0)
+```
+
+Total drift score capped at 15.
+
+---
+
+## 7.7 SIM-Swap Multi-User Detection (NEW v3)
+
+Detects multiple distinct users operating from the same device within a 24-hour window — a strong SIM-swap indicator.
+
+```cypher
+MATCH (d:Device {device_id: $device_id})<-[:USES_DEVICE]-(u:User)
+WHERE u.last_active > datetime() - duration({hours: 24})
+RETURN count(DISTINCT u) AS unique_users_24h,
+       collect(DISTINCT u.user_id) AS user_list
+```
+
+```
+SIM_Swap = DEVICE_MULTI_USER_PENALTY (25)
+  if unique_users_24h > DEVICE_MULTI_USER_THRESHOLD (3)
+
+         0
+  otherwise
+```
+
+**Edge Cases:**
+- Family devices (shared tablets) may trigger false positives → threshold set at >3 to reduce noise
+- SIM-swap attacks often show 2-4 distinct users within 2-6 hours
+- Combined with circadian anomaly, this signal has very high precision
+
+---
+
+## 7.8 New Device + High Amount + MPIN (Compound Signal)
+
+A device never seen before for this user, combined with a high-value transaction authenticated via MPIN.
+
+```
+Compound = 15
+  if is_new_device
+  AND amount ≥ NEW_DEVICE_HIGH_AMOUNT_THRESHOLD (₹10,000)
+  AND credential_sub_type == "MPIN"
+
+           0   otherwise
+```
+
+This targets fraudsters who register stolen credentials on new devices and immediately attempt large transfers.
+
+---
+
+## 7.9 Device Risk Fusion (v3)
 
 ```
 S_device = min(
     MultiAccount
-  + Emulator
   + Propagation
   + HighRiskBonus
   + OSAnomaly
+  + DeviceDrift
+  + NewDevicePenalty
+  + SIM_Swap
+  + NewDeviceHighMPIN
 , 100)
 ```
 
-| Component       | Max Points |
-| --------------- | ---------- |
-| Multi-Account   | 40         |
-| Emulator        | 25         |
-| Propagation     | 25         |
-| High-Risk Bonus | 10         |
-| OS Anomaly      | 15         |
+| Component              | Max Points | Status |
+| ---------------------- | ---------- | ------ |
+| Multi-Account          | 40         | ✅ Active |
+| Risk Propagation       | 25         | ✅ Active |
+| SIM-Swap Multi-User    | 25         | ✅ NEW |
+| Device Drift           | 15         | ✅ NEW |
+| New Device + MPIN      | 15         | ✅ NEW |
+| New Device Penalty     | 12         | ✅ Active |
+| High-Risk Bonus        | 10         | ✅ Active |
+| OS Anomaly             | 10         | ✅ Active |
+| ~~Emulator~~           | ~~25~~     | ❌ Removed (is_emulator field dropped) |
+| ~~App Downgrade~~      | ~~15~~     | ❌ Removed (NPCI forces updates) |
+| ~~Outdated App~~       | ~~10~~     | ❌ Removed (same reasoning) |
 
-Raw maximum = 115 (capped to 100).
+Theoretical maximum = 152 (capped to 100).
 
 ---
 
@@ -817,16 +970,41 @@ LowActivity = 10   if N_tx ≤ 3
 
 ---
 
-## 8.6 Dead Account Risk Fusion
+## 8.6 Sleep-and-Flash Mule Detection (NEW v3)
+
+Targets accounts that lie dormant for extended periods, then suddenly process transactions that are orders of magnitude larger than their historical average — a classic woken-mule pattern.
+
+```
+Sleep_Flash_Ratio = tx_amount / avg_tx_amount
+
+Sleep_Flash = 1
+  if Sleep_Flash_Ratio ≥ SLEEP_FLASH_RATIO_THRESHOLD (50.0)
+  AND days_slept ≥ SLEEP_FLASH_DORMANT_DAYS (30)
+```
+
+Penalty: **+20 points** added to dead-account score.
+
+**Edge Cases:**
+- Account with avg ₹100 suddenly sends ₹50,000 after 45 days dormant → ratio=500×, flagged
+- Salary accounts with seasonal large deposits may trigger → ratio threshold of 50× minimises this
+- Combined with first-strike flag, this produces very high confidence mule detection
+- The ratio is exposed in the feature dict (`sleep_flash_ratio`) for explainability
+
+---
+
+## 8.7 Dead Account Risk Fusion (v3)
 
 ```
 S_dead =
-    min(Inactivity + Spike + FirstStrike + LowActivity, 100)
+    min(Inactivity + Spike + FirstStrike + LowActivity + SleepFlash, 100)
         if dormant OR first_strike
 
     Spike · 0.3
         otherwise
 ```
+
+Where:
+- SleepFlash = 20 if `sleep_flash_flag` is True, else 0
 
 ---
 
@@ -1098,19 +1276,31 @@ def get_user_flags(self, user_id: str):
 
 ---
 
-## Signal Accumulator
+## Signal Accumulator (v3)
 
-| Signal               | Score |
-| -------------------- | ----- |
-| First-strike dormant | +0.30 |
-| Dormant activation   | +0.25 |
-| High pass-through    | +0.20 |
-| Shared device        | +0.15 |
-| Emulator             | +0.10 |
-| High-risk cluster    | +0.15 |
-| Relay pattern        | +0.10 |
-| Impossible travel    | +0.10 |
-| Amount spike         | +0.05 |
+| Signal                          | Score  | Status |
+| ------------------------------- | ------ | ------ |
+| First-strike dormant            | +0.30  | ✅ Active |
+| Dormant activation              | +0.25  | ✅ Active |
+| Sleep-and-flash mule            | +0.25  | ✅ NEW |
+| High pass-through               | +0.20  | ✅ Active |
+| SIM-swap multi-user device      | +0.20  | ✅ NEW |
+| Shared device (≥3 accounts)     | +0.15  | ✅ Active |
+| High-risk cluster               | +0.15  | ✅ Active |
+| New device + high amount + MPIN | +0.15  | ✅ Active |
+| TX identicality index           | +0.15  | ✅ NEW |
+| Relay pattern (velocity+ratio)  | +0.10  | ✅ Active |
+| Impossible travel               | +0.10  | ✅ Active |
+| Circadian anomaly               | +0.10  | ✅ NEW |
+| IP rotation                     | +0.08  | ✅ Active |
+| Capability mask change           | +0.08  | ✅ Active |
+| Fixed-amount pattern            | +0.08  | ✅ Active |
+| Amount spike                    | +0.05  | ✅ Active |
+| New/unknown device              | +0.05  | ✅ Active |
+| ~~Emulator~~                    | ~~+0.10~~ | ❌ Removed |
+| ~~App downgrade~~               | ~~+0.10~~ | ❌ Removed |
+
+Maximum possible accumulator = ~2.60 (capped at 1.0).
 
 ---
 
@@ -1192,32 +1382,41 @@ Batch layer remains fully decoupled from hot-path scoring.
 **File:** `app/core/risk_engine.py` → `_build_reason()`
 **Output:** Human-readable string explaining why a transaction was flagged
 
-### Reason Generation Rules
+### Reason Generation Rules (v3)
 
-| Condition | Reason String |
-|-----------|---------------|
-| `dead.is_dormant OR dead.is_first_strike` | "Account activated after {N} days of inactivity" |
-| `dead.pass_through_ratio > 0.80` | "Pass-through ratio {X}% exceeds threshold" |
-| `graph.community_risk > 50` | "Community #{id} has {X}% fraud density" |
-| `graph.betweenness > 0.01` | "High betweenness centrality (money router)" |
-| `device.account_count ≥ 5` | "Shared device with {N} other accounts" |
-| `device.is_emulator` | "Transaction from emulated device" |
-| `behav.impossible_travel` | "Impossible travel detected between consecutive transactions" |
-| `behav.amount_zscore > 3` | "Amount z-score {X}x above user baseline" |
-| `behav.is_night` | "Unusual night-time transaction" |
-| `behav.asn_risk ≥ 0.5` | "High ASN risk: {CLASS} network (country: {CC})" |
-| `behav.foreign_flag` | "Foreign IP origin: {country}" |
-| `behav.asn_drift` | "ASN drift: unusual network for this user" |
-| `behav.sim_not_verified` | "SIM not verified for this transaction" |
-| `vel.tx_per_min > 5` | "Velocity: {X} tx/min in last window" |
-| `vel.outflow_inflow_ratio > 0.80` | "Rapid fund relay pattern" |
-| No triggers but R ≥ 70 | "Multiple minor indicators combined above threshold" |
-| No triggers and R < 70 | "No significant risk indicators" |
+| Condition | Reason String | Status |
+|-----------|---------------|--------|
+| `dead.is_dormant OR dead.is_first_strike` | "Account activated after {N} days of inactivity" | ✅ |
+| `dead.pass_through_ratio > 0.80` | "Pass-through ratio {X}% exceeds threshold" | ✅ |
+| `dead.sleep_flash_flag` | "Sleep-and-flash mule: amount {X}x above historical avg, dormant >30d" | ✅ NEW |
+| `graph.community_risk > 50` | "Community #{id} has {X}% fraud density" | ✅ |
+| `graph.betweenness > 0.01` | "High betweenness centrality (money router)" | ✅ |
+| `device.account_count ≥ 5` | "Shared device with {N} other accounts" | ✅ |
+| `device.new_device_flag` | "Transaction from a new/unseen device" | ✅ |
+| `device.cap_mask_anomaly > 0` | "Device capability mask changed unexpectedly" | ✅ |
+| `device.new_device_high_mpin` | "New device + high amount + MPIN authentication" | ✅ |
+| `device.device_multi_user_flag` | "SIM-swap: {N} users on same device in 24h" | ✅ NEW |
+| `behav.impossible_travel` | "Impossible travel detected between consecutive transactions" | ✅ |
+| `behav.amount_zscore > 3` | "Amount z-score {X}x above user baseline" | ✅ |
+| `behav.is_night` | "Unusual night-time transaction" | ✅ |
+| `behav.asn_risk ≥ 0.5` | "High ASN risk: {CLASS} network (country: {CC})" | ✅ |
+| `behav.foreign_flag` | "Foreign IP origin: {country}" | ✅ |
+| `behav.asn_drift` | "ASN drift: unusual network for this user" | ✅ |
+| `behav.ip_rotation_flag` | "IP rotation: {N} unique IPs in 24h" | ✅ |
+| `behav.fixed_amount_flag` | "Fixed-amount pattern: repeated identical transfers" | ✅ |
+| `behav.circadian_anomaly` | "Circadian anomaly: transaction at unusual hour for this user" | ✅ NEW |
+| `behav.tx_identicality_flag` | "TX identicality: {N} identical-amount transfers to same receiver" | ✅ NEW |
+| `vel.tx_per_min > 5` | "Velocity: {X} tx/min in last window" | ✅ |
+| `vel.outflow_inflow_ratio > 0.80` | "Rapid fund relay pattern" | ✅ |
+| No triggers but R ≥ 70 | "Multiple minor indicators combined above threshold" | ✅ |
+| No triggers and R < 70 | "No significant risk indicators" | ✅ |
+| ~~`behav.sim_not_verified`~~ | ~~"SIM not verified for this transaction"~~ | ❌ Removed |
+| ~~`device.is_emulator`~~ | ~~"Transaction from emulated device"~~ | ❌ Removed |
 
 **Format:** Reasons are joined with ". " and terminated with a period.
 
 **Example output:**
-> "Account activated after 45 days of inactivity. Amount z-score 4.2x above user baseline. High ASN risk: HOSTING network (country: IN). SIM not verified for this transaction."
+> "Account activated after 45 days of inactivity. Sleep-and-flash mule: amount 62x above historical avg, dormant >30d. Amount z-score 4.2x above user baseline. SIM-swap: 4 users on same device in 24h. Circadian anomaly: transaction at unusual hour for this user."
 
 ---
 
@@ -1252,6 +1451,8 @@ if x < Q1 - k·IQR
 
 Default: k = 1.5
 Minimum required samples: 4
+
+**v3 note:** IQR outlier detection is now the primary amount-outlier signal in the behavioral extractor, replacing Mahalanobis distance which required N>30 for stable covariance estimation.
 
 ---
 
@@ -1499,6 +1700,33 @@ All parameters overrideable via environment variables.
 
 ---
 
+## v3 Feature Parameters (NEW)
+
+| Variable                          | Default  | Description |
+| --------------------------------- | -------- | ----------- |
+| DEVICE_MULTI_USER_THRESHOLD       | 3        | Max distinct users on device before SIM-swap flag |
+| DEVICE_MULTI_USER_WINDOW_HOURS    | 24       | Window for multi-user count |
+| DEVICE_MULTI_USER_PENALTY         | 25.0     | Risk points for SIM-swap detection |
+| CIRCADIAN_ANOMALY_PENALTY         | 20.0     | Points for unusual-hour transaction |
+| CIRCADIAN_NEW_DEVICE_PENALTY      | 35.0     | Amplified penalty: circadian + new device |
+| TX_IDENTICALITY_WINDOW_HOURS      | 1        | Window for same-amount-same-receiver check |
+| TX_IDENTICALITY_MIN_COUNT         | 3        | Min identical transfers to flag |
+| TX_IDENTICALITY_PENALTY           | 30.0     | Risk points for structuring detection |
+| SLEEP_FLASH_RATIO_THRESHOLD       | 50.0     | current_amount / avg_amount ratio to flag |
+| SLEEP_FLASH_DORMANT_DAYS          | 30       | Min dormancy days for sleep-flash detection |
+| CAPABILITY_MASK_CHANGE_WEIGHT     | 10.0     | Hamming distance weight for mask drift |
+| NEW_DEVICE_HIGH_AMOUNT_THRESHOLD  | 10,000   | Amount threshold for new device compound |
+| NEW_DEVICE_PENALTY                | 12.0     | Base penalty for unseen device |
+| IP_ROTATION_WINDOW_HOURS          | 24       | Window for IP rotation count |
+| IP_ROTATION_MAX_UNIQUE            | 5        | Unique IPs before rotation flag |
+| IP_ROTATION_PENALTY               | 15.0     | Risk points for IP rotation |
+| FIXED_AMOUNT_TOLERANCE            | 0.01     | % tolerance for fixed-amount matching |
+| FIXED_AMOUNT_MIN_COUNT            | 3        | Min repeated amounts to flag |
+| FIXED_AMOUNT_PENALTY              | 10.0     | Risk points for structuring |
+| GEO_IP_DISTANCE_THRESHOLD_KM      | 500.0    | Geo-IP distance anomaly threshold |
+
+---
+
 # 20. Deployment Guide
 
 ## Prerequisites
@@ -1651,7 +1879,7 @@ R = 0.30·S_graph
 
 ---
 
-## Behavioural Sub-Score
+## Behavioural Sub-Score (v3)
 
 ```
 S_b = min(
@@ -1659,11 +1887,14 @@ S_b = min(
   + V·20
   + 𝟙[IT]·20
   + 𝟙[Night]·5
-  + min(D_M·2, 15)
+  + 𝟙[IQR]·15
   + 𝟙[Spike]·10
   + 𝟙[DormantBurst]·15
   + R_ASN·20
-  + 𝟙[¬SIM]·10
+  + 𝟙[IPRotation]·15
+  + 𝟙[FixedAmt]·10
+  + C_circadian
+  + 𝟙[TxIdent]·30
 , 100)
 ```
 
@@ -1702,10 +1933,58 @@ d = 2R · arctan2(
 
 ---
 
-## Mahalanobis Distance
+## IQR Outlier Detection (Replaced Mahalanobis)
 
 ```
-D_M = √((x - μ)ᵀ Σ⁻¹ (x - μ))
+Q1 = P_25(amounts)
+Q3 = P_75(amounts)
+IQR = Q3 - Q1
+Outlier = 𝟙[x < Q1 - 1.5·IQR  ∨  x > Q3 + 1.5·IQR]
+```
+
+---
+
+## Circadian Anomaly Score
+
+```
+p(h) = count(tx at hour h) / total_tx
+
+C_circadian =
+    35   if p(h) < 0.02 AND is_new_device
+    20   if p(h) < 0.02
+    0    otherwise
+
+Requires: total_tx ≥ 10
+```
+
+---
+
+## TX Identicality Index
+
+```
+I(s, r, a, w) = |{tx : sender=s, receiver=r, |tx.amount - a| < 1, tx ∈ window_w}|
+
+TxIdent = 𝟙[I ≥ 3]
+```
+
+---
+
+## Sleep-and-Flash Ratio
+
+```
+SF = A_t / Ā_profile
+
+Sleep_Flash = 𝟙[SF ≥ 50  ∧  days_dormant ≥ 30]
+```
+
+---
+
+## SIM-Swap Multi-User Score
+
+```
+N_users = |{u : (u)-[:USES_DEVICE]->(d), u.last_active > t - 24h}|
+
+SIM_Swap = 𝟙[N_users > 3] · 25
 ```
 
 ---
@@ -1744,15 +2023,19 @@ F1 = 2PR / (P + R)
 
 The system now has:
 
-• Full mathematical formalisation
-• Clear modular architecture
-• Privacy-aware design
-• Regulatory positioning
+• Full mathematical formalisation (v3)
+• Clear modular architecture with 5 concurrent feature extractors
+• Privacy-aware design (DPDP Act compliant)
+• Regulatory positioning (RBI aligned)
 • Production deployment path
+• **17 active fraud signals** across behavioral, device, dead-account, graph, and velocity domains
+• **4 new v3 detectors**: SIM-swap multi-user, Circadian anomaly, TX identicality index, Sleep-and-flash mule
+• **Compound signal support**: circadian + new device amplification in risk engine post-gather
+• **Removed weak signals**: Mahalanobis distance, app version/downgrade, SIM verification, is_emulator
 
 This document is structurally equivalent to a technical whitepaper for a fintech-grade fraud intelligence engine.
 
 ---
 
-*Built for the Indian UPI ecosystem. Designed for 500 TPS. Every transaction scored in under 200 ms.*
+*Built for the Indian UPI ecosystem. Designed for 500 TPS. Every transaction scored in under 200 ms. Version 3 — February 2026.*
 

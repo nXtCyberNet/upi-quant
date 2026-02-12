@@ -74,41 +74,33 @@ async def score_transaction(tx: TransactionInput):
     if not _neo4j or not _risk_engine:
         raise HTTPException(503, "Engine not ready")
 
+    # Build ingest params from nested v2 schema
+    ingest_params = {
+        "sender_id": tx.sender_id,
+        "receiver_id": tx.receiver_id,
+        "device_id": tx.device_id,
+        "device_os": tx.device_os,
+        "device_type": tx.device_type.value if tx.device_type else None,
+        "app_version": tx.app_version,
+        "capability_mask": tx.capability_mask,
+        "tx_id": tx.tx_id,
+        "amount": tx.amount,
+        "timestamp": tx.timestamp.isoformat(),
+        "currency": tx.currency,
+        "txn_type": tx.txn_type.value,
+        "credential_type": tx.credential_type.value if tx.credential_type else None,
+        "credential_sub_type": tx.credential_sub_type.value if tx.credential_sub_type else None,
+        "receiver_type": tx.receiver_type.value,
+        "mcc_code": tx.mcc_code,
+    }
+
     # Ingest (try lock-free first, fall back to safe)
     try:
-        await _neo4j.write_async(
-            INGEST_TRANSACTION,
-            {
-                "sender_id": tx.sender_id,
-                "receiver_id": tx.receiver_id,
-                "device_hash": tx.device_hash,
-                "device_os": tx.device_os,
-                "device_model": tx.device_model,
-                "device_is_emulator": tx.device_is_emulator,
-                "tx_id": tx.tx_id,
-                "amount": tx.amount,
-                "timestamp": tx.timestamp.isoformat(),
-                "channel": tx.channel.value,
-            },
-        )
+        await _neo4j.write_async(INGEST_TRANSACTION, ingest_params)
     except Exception:
         # Fall back to safe ingest (auto-creates Users)
         try:
-            await _neo4j.write_async(
-                INGEST_TRANSACTION_SAFE,
-                {
-                    "sender_id": tx.sender_id,
-                    "receiver_id": tx.receiver_id,
-                    "device_hash": tx.device_hash,
-                    "device_os": tx.device_os,
-                    "device_model": tx.device_model,
-                    "device_is_emulator": tx.device_is_emulator,
-                    "tx_id": tx.tx_id,
-                    "amount": tx.amount,
-                    "timestamp": tx.timestamp.isoformat(),
-                    "channel": tx.channel.value,
-                },
-            )
+            await _neo4j.write_async(INGEST_TRANSACTION_SAFE, ingest_params)
         except Exception as exc:
             logger.error("Ingestion failed: %s", exc)
             raise HTTPException(500, f"Ingestion error: {exc}")
@@ -124,8 +116,8 @@ async def score_transaction(tx: TransactionInput):
                 "is_vpn": False,
                 "city": None,
                 "country": asn_info.get("country") or None,
-                "asn": asn_info.get("asn") or tx.ip_asn,
-                "asn_type": asn_info.get("asn_class") or (tx.ip_asn_type.value if tx.ip_asn_type else None),
+                "asn": asn_info.get("asn") or None,
+                "asn_type": asn_info.get("asn_class") or None,
                 "asn_org": asn_info.get("org_name") or None,
                 "asn_country": asn_info.get("country") or None,
                 "user_id": tx.sender_id,

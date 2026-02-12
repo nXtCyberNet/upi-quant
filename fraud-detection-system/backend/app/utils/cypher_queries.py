@@ -25,7 +25,7 @@ Edges   :SENT  :RECEIVED_BY  :USES_DEVICE  :ACCESSED_FROM
 
 SCHEMA_CONSTRAINTS: list[str] = [
     "CREATE CONSTRAINT user_id_uniq   IF NOT EXISTS FOR (u:User)        REQUIRE u.user_id     IS UNIQUE",
-    "CREATE CONSTRAINT device_uniq    IF NOT EXISTS FOR (d:Device)      REQUIRE d.device_hash IS UNIQUE",
+    "CREATE CONSTRAINT device_uniq    IF NOT EXISTS FOR (d:Device)      REQUIRE d.device_id   IS UNIQUE",
     "CREATE CONSTRAINT tx_id_uniq     IF NOT EXISTS FOR (t:Transaction) REQUIRE t.tx_id       IS UNIQUE",
     "CREATE CONSTRAINT ip_uniq        IF NOT EXISTS FOR (i:IP)          REQUIRE i.ip_address  IS UNIQUE",
     "CREATE CONSTRAINT cluster_uniq   IF NOT EXISTS FOR (c:Cluster)     REQUIRE c.cluster_id  IS UNIQUE",
@@ -53,24 +53,32 @@ SCHEMA_INDEXES: list[str] = [
 INGEST_TRANSACTION = """
 MATCH (s:User {user_id: $sender_id})
 MATCH (r:User {user_id: $receiver_id})
-MERGE (d:Device {device_hash: $device_hash})
-  ON CREATE SET d.device_score  = 0.0,
-                d.account_count = 0,
-                d.os            = $device_os,
-                d.model         = $device_model,
-                d.is_emulator   = $device_is_emulator,
-                d.created_at    = datetime()
-  ON MATCH SET  d.os            = coalesce(d.os, $device_os),
-                d.model         = coalesce(d.model, $device_model),
-                d.is_emulator   = coalesce(d.is_emulator, $device_is_emulator)
+MERGE (d:Device {device_id: $device_id})
+  ON CREATE SET d.device_score    = 0.0,
+                d.account_count   = 0,
+                d.os              = $device_os,
+                d.device_type     = $device_type,
+                d.app_version     = $app_version,
+                d.capability_mask = $capability_mask,
+                d.created_at      = datetime()
+  ON MATCH SET  d.os              = coalesce($device_os, d.os),
+                d.device_type     = coalesce($device_type, d.device_type),
+                d.app_version     = coalesce($app_version, d.app_version),
+                d.capability_mask = coalesce($capability_mask, d.capability_mask)
 
 CREATE (tx:Transaction {
-    tx_id:      $tx_id,
-    amount:     $amount,
-    timestamp:  datetime($timestamp),
-    channel:    $channel,
-    status:     'PENDING',
-    risk_score: 0.0
+    tx_id:           $tx_id,
+    amount:          $amount,
+    timestamp:       datetime($timestamp),
+    currency:        $currency,
+    txn_type:        $txn_type,
+    channel:         'UPI',
+    credential_type: $credential_type,
+    credential_sub:  $credential_sub_type,
+    receiver_type:   $receiver_type,
+    mcc_code:        $mcc_code,
+    status:          'PENDING',
+    risk_score:      0.0
 })
 
 CREATE (s)-[:SENT]->(tx)-[:RECEIVED_BY]->(r)
@@ -115,24 +123,32 @@ MERGE (r:User {user_id: $receiver_id})
                 r.is_dormant    = false,
                 r.risk_score    = 0.0
 
-MERGE (d:Device {device_hash: $device_hash})
-  ON CREATE SET d.device_score  = 0.0,
-                d.account_count = 0,
-                d.os            = $device_os,
-                d.model         = $device_model,
-                d.is_emulator   = $device_is_emulator,
-                d.created_at    = datetime()
-  ON MATCH SET  d.os            = coalesce(d.os, $device_os),
-                d.model         = coalesce(d.model, $device_model),
-                d.is_emulator   = coalesce(d.is_emulator, $device_is_emulator)
+MERGE (d:Device {device_id: $device_id})
+  ON CREATE SET d.device_score    = 0.0,
+                d.account_count   = 0,
+                d.os              = $device_os,
+                d.device_type     = $device_type,
+                d.app_version     = $app_version,
+                d.capability_mask = $capability_mask,
+                d.created_at      = datetime()
+  ON MATCH SET  d.os              = coalesce($device_os, d.os),
+                d.device_type     = coalesce($device_type, d.device_type),
+                d.app_version     = coalesce($app_version, d.app_version),
+                d.capability_mask = coalesce($capability_mask, d.capability_mask)
 
 CREATE (tx:Transaction {
-    tx_id:      $tx_id,
-    amount:     $amount,
-    timestamp:  datetime($timestamp),
-    channel:    $channel,
-    status:     'PENDING',
-    risk_score: 0.0
+    tx_id:           $tx_id,
+    amount:          $amount,
+    timestamp:       datetime($timestamp),
+    currency:        $currency,
+    txn_type:        $txn_type,
+    channel:         'UPI',
+    credential_type: $credential_type,
+    credential_sub:  $credential_sub_type,
+    receiver_type:   $receiver_type,
+    mcc_code:        $mcc_code,
+    status:          'PENDING',
+    risk_score:      0.0
 })
 
 CREATE (s)-[:SENT]->(tx)-[:RECEIVED_BY]->(r)
@@ -327,24 +343,26 @@ RETURN u.user_id        AS user_id,
 # ==============================================================
 
 QUERY_DEVICE_INFO = """
-MATCH (d:Device {device_hash: $device_hash})
+MATCH (d:Device {device_id: $device_id})
 OPTIONAL MATCH (d)<-[:USES_DEVICE]-(u:User)
 WITH d, collect(u.user_id) AS linked_users, count(u) AS acc_cnt
-RETURN d.device_hash    AS device_hash,
-       d.os             AS os,
-       d.is_emulator    AS is_emulator,
-       d.device_score   AS device_score,
-       acc_cnt          AS account_count,
+RETURN d.device_id        AS device_id,
+       d.os               AS os,
+       d.device_type      AS device_type,
+       d.app_version      AS app_version,
+       d.capability_mask  AS capability_mask,
+       d.device_score     AS device_score,
+       acc_cnt            AS account_count,
        linked_users
 """
 
 QUERY_DEVICE_RISK_PROPAGATION = """
-MATCH (d:Device {device_hash: $device_hash})<-[:USES_DEVICE]-(u:User)
+MATCH (d:Device {device_id: $device_id})<-[:USES_DEVICE]-(u:User)
 WITH d,
      avg(u.risk_score)  AS avg_user_risk,
      max(u.risk_score)  AS max_user_risk,
      count(u)           AS user_count
-RETURN d.device_hash AS device_hash,
+RETURN d.device_id AS device_id,
        avg_user_risk,
        max_user_risk,
        user_count,
@@ -360,18 +378,70 @@ QUERY_SHARED_DEVICE_CLUSTERS = """
 MATCH (d:Device)<-[:USES_DEVICE]-(u:User)
 WITH d, collect(u) AS users, count(u) AS cnt
 WHERE cnt >= $min_accounts
-RETURN d.device_hash                AS device_hash,
-       cnt                          AS user_count,
-       [u IN users | u.user_id]     AS user_ids,
-       [u IN users | u.risk_score]  AS risk_scores,
-       d.device_score               AS device_score
+RETURN d.device_id                      AS device_id,
+       cnt                              AS user_count,
+       [u IN users | u.user_id]         AS user_ids,
+       [u IN users | u.risk_score]      AS risk_scores,
+       d.device_score                   AS device_score
 ORDER BY cnt DESC
 """
 
 UPDATE_DEVICE_SCORE = """
-MATCH (d:Device {device_hash: $device_hash})
+MATCH (d:Device {device_id: $device_id})
 SET d.device_score = $score
-RETURN d.device_hash AS device_hash
+RETURN d.device_id AS device_id
+"""
+
+# ── New device-history query (for drift/new-device detection) ──
+
+QUERY_USER_DEVICE_HISTORY = """
+MATCH (u:User {user_id: $user_id})-[:USES_DEVICE]->(d:Device)
+RETURN d.device_id        AS device_id,
+       d.os               AS os,
+       d.device_type      AS device_type,
+       d.app_version      AS app_version,
+       d.capability_mask  AS capability_mask,
+       d.created_at       AS first_seen
+ORDER BY d.created_at DESC
+"""
+
+# ── IP rotation query (unique IPs in recent window) ──
+
+QUERY_IP_ROTATION = """
+MATCH (u:User {user_id: $user_id})-[:ACCESSED_FROM]->(i:IP)
+RETURN count(DISTINCT i.ip_address) AS unique_ip_count,
+       collect(DISTINCT i.ip_address) AS ip_list
+"""
+
+# ── Recent amounts for fixed-amount pattern detection ──
+
+QUERY_RECENT_AMOUNTS = """
+MATCH (u:User {user_id: $user_id})-[:SENT]->(tx:Transaction)
+WHERE tx.timestamp > datetime() - duration({hours: $window_hours})
+RETURN tx.amount AS amount
+ORDER BY tx.timestamp DESC
+LIMIT 20
+"""
+
+QUERY_DEVICE_USERS_24H = """
+MATCH (d:Device {device_id: $device_id})<-[:USES_DEVICE]-(u:User)
+WHERE u.last_active > datetime() - duration({hours: 24})
+RETURN count(DISTINCT u.user_id) AS unique_users_24h,
+       collect(DISTINCT u.user_id) AS user_list
+"""
+
+QUERY_USER_HOUR_DISTRIBUTION = """
+MATCH (u:User {user_id: $user_id})-[:SENT]->(tx:Transaction)
+RETURN tx.timestamp.hour AS hour, count(tx) AS cnt
+ORDER BY hour
+"""
+
+QUERY_IDENTICAL_TX_RECEIVER = """
+MATCH (u:User {user_id: $sender_id})-[:SENT]->(tx:Transaction)
+      -[:RECEIVED_BY]->(r:User {user_id: $receiver_id})
+WHERE tx.timestamp > datetime() - duration({hours: $window_hours})
+  AND abs(tx.amount - $amount) < 1.0
+RETURN count(tx) AS identical_count
 """
 
 # ==============================================================
@@ -399,7 +469,7 @@ RETURN u.user_id          AS user_id,
        CASE WHEN size(out_risks) > 0
             THEN reduce(s=0.0, r IN out_risks | s+r)/size(out_risks)
             ELSE 0.0 END   AS avg_neighbor_risk,
-       d.device_hash       AS device_hash,
+       d.device_id         AS device_id,
        d.account_count     AS device_account_count
 """
 
@@ -708,7 +778,7 @@ WITH d,
      collect({id: u.user_id, risk: u.risk_score}) AS users,
      count(u) AS cnt
 WHERE cnt >= 2
-RETURN d.device_hash   AS device_hash,
+RETURN d.device_id     AS device_id,
        cnt             AS shared_count,
        users,
        d.device_score  AS device_score
